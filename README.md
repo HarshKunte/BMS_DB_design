@@ -1,5 +1,8 @@
 # BookMyShow-Scale Ticketing Backend: Database & System Design
 
+MySQL 8.0+ (InnoDB). All SQL below runs as-is in the `mysql` client / Workbench.
+`movie_show` and `app_user` are used instead of `show` / `user` to avoid reserved-word clashes.
+
 ---
 
 ## 1. Entities and relationships
@@ -200,7 +203,35 @@ CREATE TABLE payment (
 
 ### Guard trigger: no overlapping shows on one screen
 
-`UNIQUE(screen_id, start_time)` only stops identical start times. This trigger rejects any overlap, including a 15-minute cleaning buffer. 
+`UNIQUE(screen_id, start_time)` only stops identical start times. This trigger rejects any overlap, including a 15-minute cleaning buffer. Run it with the `DELIMITER` lines in the mysql client. Create it **before** loading show data.
+
+```sql
+DELIMITER $$
+CREATE TRIGGER trg_show_no_overlap
+BEFORE INSERT ON movie_show
+FOR EACH ROW
+BEGIN
+  DECLARE clashes INT DEFAULT 0;
+  DECLARE new_len INT;
+  SELECT duration_min INTO new_len FROM movie WHERE movie_id = NEW.movie_id;
+
+  SELECT COUNT(*) INTO clashes
+  FROM movie_show s
+  JOIN movie m ON m.movie_id = s.movie_id
+  WHERE s.screen_id = NEW.screen_id
+    AND s.status <> 'CANCELLED'
+    AND s.start_time < NEW.start_time + INTERVAL (new_len + 15) MINUTE
+    AND s.start_time + INTERVAL (m.duration_min + 15) MINUTE > NEW.start_time;
+
+  IF clashes > 0 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Show overlaps with an existing show on this screen';
+  END IF;
+END$$
+DELIMITER ;
+```
+
+---
+
 ## 3. Sample data
 
 ```sql
@@ -321,8 +352,178 @@ There is no stored price per sold seat. A seat's price is derived as `show_price
 
 ---
 
+## 5. Concurrency design: no double-booking, no lost holds
 
-## 5. P2: list all shows for a theatre on a date
+### 5.1 Layers of defence
+
+| Layer | Mechanism | Guarantees |
+|---|---|---|
+| L1 (speed) | **Redis** `SET NX PX` per seat (atomic Lua for multi-seat) | Rejects most losers in microseconds without touching MySQL. Auto-expires after 10 min. |
+| L2 (authority) | **MySQL row locks** on `show_seat` (`SELECT … FOR UPDATE SKIP LOCKED`) | Only one transaction can move a seat to `HELD`. |
+| L3 (invariant) | `UNIQUE(show_id, seat_id)` on `show_seat` and `UNIQUE(show_seat_id)` on `booking_seat` | Even a buggy app or a Redis failure **cannot** sell a seat twice. |
+| L4 (durability) | Hold = `show_seat.status='HELD'` + `booking.expires_at` in MySQL | Losing Redis does not lose holds. A sweeper releases expired ones. |
+
+### 5.2 Pessimistic vs optimistic
+
+| | Pessimistic (`FOR UPDATE`) | Optimistic (`version` / conditional `UPDATE`) |
+|---|---|---|
+| Best when | Contention is high (front rows of a blockbuster) | Contention is rare |
+| Cost under contention | Short waits, no wasted work | Many failed attempts and retries |
+| Failure mode | Deadlocks (avoided by locking in `seat_id` order) | Retry storms |
+
+**Choice:** seat holds use **pessimistic** locking, because hot seats are contended by thousands of users and losers should fail fast. `SKIP LOCKED` means a loser never queues behind the winner. Booking status changes (`PENDING → CONFIRMED`) use **optimistic** conditional updates (`WHERE status='PENDING'`), because there is normally a single writer per booking.
+
+### 5.3 Step 1: hold seats (transaction)
+
+```sql
+-- inputs: show 1, seats 5 and 6, user 1
+START TRANSACTION;
+
+-- Lock candidate rows in a deterministic order (prevents deadlocks).
+-- Claimable = AVAILABLE, or HELD by a booking whose deadline has passed.
+SELECT ss.show_seat_id
+FROM show_seat ss
+LEFT JOIN booking hb ON hb.booking_id = ss.hold_booking_id
+WHERE ss.show_id = 1
+  AND ss.seat_id IN (5,6)
+  AND (ss.status = 'AVAILABLE'
+       OR (ss.status = 'HELD' AND hb.status = 'PENDING' AND hb.expires_at < NOW()))
+ORDER BY ss.seat_id
+FOR UPDATE OF ss SKIP LOCKED;
+-- APPLICATION CHECK: rows returned must equal the seats requested (2).
+-- If fewer -> ROLLBACK and tell the user "seat(s) just taken". No waiting.
+
+INSERT INTO booking (user_id, show_id, status, expires_at)
+VALUES (1, 1, 'PENDING', NOW() + INTERVAL 10 MINUTE);
+SET @bid = LAST_INSERT_ID();
+
+UPDATE show_seat
+SET status = 'HELD', hold_booking_id = @bid, version = version + 1
+WHERE show_id = 1 AND seat_id IN (5,6);            -- rows already locked above
+
+-- Amount is computed server-side from show_price, never trusted from the client
+INSERT INTO payment (booking_id, amount)
+SELECT @bid, SUM(sp.price)
+FROM show_seat ss
+JOIN seat st       ON st.seat_id = ss.seat_id
+JOIN show_price sp ON sp.show_id = ss.show_id AND sp.category_id = st.category_id
+WHERE ss.hold_booking_id = @bid;
+
+COMMIT;
+```
+
+**Optimistic variant** (no explicit lock; the `WHERE` clause is the compare-and-set):
+
+```sql
+UPDATE show_seat
+SET status='HELD', hold_booking_id=@bid, version=version+1
+WHERE show_seat_id = 5 AND version = 0 AND status = 'AVAILABLE';
+-- ROW_COUNT() = 0  ->  someone else won; abort and roll back the other seats.
+```
+
+### 5.4 Redis fast path
+
+```lua
+-- KEYS: hold:{<show_id>}:<seat_id> ... (hash tag keeps all seats of a show in one cluster slot)
+-- ARGV[1] = booking_id, ARGV[2] = ttl in ms (600000)
+for _, k in ipairs(KEYS) do
+  if redis.call('EXISTS', k) == 1 then return 0 end   -- any seat taken -> all-or-nothing fail
+end
+for _, k in ipairs(KEYS) do
+  redis.call('SET', k, ARGV[1], 'PX', ARGV[2])
+end
+return 1
+```
+
+Flow: Lua script → success → MySQL hold transaction (5.3) → on any failure, delete the Redis keys. Redis is only an accelerator: if it is empty or flushed, correctness still comes from MySQL.
+
+### 5.5 Step 2: timed release (sweeper)
+
+```sql
+SET GLOBAL event_scheduler = ON;
+
+DELIMITER $$
+CREATE EVENT ev_release_expired_holds
+ON SCHEDULE EVERY 30 SECOND
+DO
+BEGIN
+  -- 1) free seats whose booking hold has expired
+  UPDATE show_seat ss
+  JOIN booking b ON b.booking_id = ss.hold_booking_id
+  SET ss.status = 'AVAILABLE', ss.hold_booking_id = NULL, ss.version = ss.version + 1
+  WHERE ss.status = 'HELD' AND b.status = 'PENDING' AND b.expires_at < NOW();
+
+  -- 2) then mark those bookings expired
+  UPDATE booking SET status = 'EXPIRED'
+  WHERE status = 'PENDING' AND expires_at < NOW();
+END$$
+DELIMITER ;
+```
+
+Even before the sweeper runs, the claim query in 5.3 treats an expired hold as claimable, so users never wait for it. If the booking table grows large, an optional `KEY (status, expires_at)` on `booking` speeds up the sweep. If the sweeper collides with a webhook, retry on deadlock (error 1213).
+
+### 5.6 Step 3: idempotent payment webhook
+
+Without a separate webhook table, `payment.gateway_payment_id` (`UNIQUE`, `NULL` until paid) is the idempotency key. The gateway is asked to echo our `booking_id` (as order receipt / notes) in the webhook. The **claim** and the **confirmation** run in **one transaction**, so a failed attempt rolls the claim back and the gateway's retry can succeed.
+
+```sql
+-- webhook: booking_id = 2, gateway_payment_id = 'pay_88aa1'
+START TRANSACTION;
+
+-- (a) CLAIM: only the first delivery can move gateway_payment_id from NULL.
+--     Concurrent duplicates block on this row lock until the first transaction commits,
+--     then find gateway_payment_id already set.
+UPDATE payment
+SET gateway_payment_id = 'pay_88aa1'
+WHERE booking_id = 2 AND gateway_payment_id IS NULL;
+-- ROW_COUNT() = 0  -> duplicate / replay: ROLLBACK, return HTTP 200, do nothing else.
+-- Error 1062       -> that gateway payment id is already attached to another booking: reject.
+
+-- (b) Lock the booking and read what was charged
+SELECT b.status AS booking_status, p.amount
+FROM booking b JOIN payment p ON p.booking_id = b.booking_id
+WHERE b.booking_id = 2
+FOR UPDATE;
+
+-- (c) Lock the seats still held by THIS booking and compute their price
+SELECT ss.show_seat_id, sp.price
+FROM show_seat ss
+JOIN seat st       ON st.seat_id = ss.seat_id
+JOIN show_price sp ON sp.show_id = ss.show_id AND sp.category_id = st.category_id
+WHERE ss.hold_booking_id = 2 AND ss.status = 'HELD'
+ORDER BY ss.show_seat_id
+FOR UPDATE OF ss;
+-- APPLICATION CHECK: booking_status = 'PENDING' AND SUM(price) = payment.amount.
+--   true  -> continue (happy path below)
+--   false -> hold was lost (expired and resold): go to the refund branch
+
+-- (d) Happy path
+INSERT INTO booking_seat (booking_id, show_seat_id)
+SELECT 2, show_seat_id FROM show_seat
+WHERE hold_booking_id = 2 AND status = 'HELD';
+
+UPDATE show_seat
+SET status = 'BOOKED', hold_booking_id = NULL, version = version + 1
+WHERE hold_booking_id = 2 AND status = 'HELD';
+
+UPDATE booking SET status = 'CONFIRMED' WHERE booking_id = 2 AND status = 'PENDING';
+UPDATE payment SET status = 'SUCCESS'   WHERE booking_id = 2;
+COMMIT;
+
+-- Refund branch (paid, but the seats are gone): keep the claim, flag for refund, commit
+-- UPDATE payment SET status = 'REFUND_REQUIRED' WHERE booking_id = 2;
+-- COMMIT;
+```
+
+Confirmation checks **who currently holds the seat** (`hold_booking_id`), not the clock. A payment that lands a few seconds after expiry still succeeds if nobody else took the seats, and a customer is never charged for nothing. Even if this logic had a bug, `UNIQUE(show_seat_id)` on `booking_seat` would refuse a second sale of the same seat.
+
+### 5.7 Burst handling
+
+For a blockbuster opening, put a **virtual waiting room / queue** (SQS/Kafka + rate limiter) in front of the hold endpoint so MySQL sees a smooth, bounded request rate. Webhooks are acknowledged quickly and processed by workers. The claim step above makes at-least-once delivery safe.
+
+---
+
+## 6. P2: list all shows for a theatre on a date
 
 ```sql
 SET @theatre_id = 1;
@@ -382,7 +583,7 @@ ORDER BY m.title, s.format;
 | 1 | Stellar Run | 2D | 10:00 AM, 02:00 PM |
 | 1 | Stellar Run | 3D | 01:00 PM |
 
-**The "next 7 dates" strip** (dates with at least one show are the ones to enable):
+**Bonus: the "next 7 dates" strip** (dates with at least one show are the ones to enable):
 
 ```sql
 WITH RECURSIVE next7 AS (
@@ -400,3 +601,70 @@ LEFT JOIN (
 GROUP BY n.show_date
 ORDER BY n.show_date;
 ```
+
+**Why it's fast:** `screen` is found through the FK index on `theatre_id`, then `movie_show` is range-scanned on `uq_show_screen_time (screen_id, start_time)`. The `start_time` range predicate keeps the index usable (`DATE(start_time) = …` would force a scan). Check with `EXPLAIN`. For today's date, add `AND s.start_time > NOW()` to hide shows that already started.
+
+---
+
+## 7. Load / concurrency test plan
+
+**Goal:** prove that under heavy contention no seat is sold twice and no hold is lost.
+
+| Scenario | Setup | Expected |
+|---|---|---|
+| Hot-seat race | 1,000 virtual users all try to hold the **same 10 seats** of one show | Exactly 10 holds succeed; 990 get "seat taken" quickly |
+| Hold expiry | Hold a seat, never pay, wait past expiry | Seat is claimable again by the next user |
+| Webhook replay | Send the same `gateway_payment_id` for one booking 50× in parallel | One confirmation, 49 no-ops |
+| Late payment | Hold expires, seat resold, then webhook arrives | Payment goes to `REFUND_REQUIRED`, no double sale |
+| Burst | Ramp 0 → 5,000 users in 10 s through the queue | MySQL connections and p95 latency stay bounded |
+
+```javascript
+// k6: every VU fights for the same seats
+import http from 'k6/http';
+import { check } from 'k6';
+
+export const options = { vus: 1000, duration: '30s' };
+
+export default function () {
+  const seat = 1 + Math.floor(Math.random() * 10);
+  const res = http.post('http://localhost:8080/shows/1/hold',
+    JSON.stringify({ userId: __VU, seatIds: [seat] }),
+    { headers: { 'Content-Type': 'application/json' } });
+  check(res, { 'ok or clean conflict': r => r.status === 200 || r.status === 409 });
+}
+```
+
+**Correctness assertions (run after the test; each must return zero rows):**
+
+```sql
+-- 1) No seat sold twice
+SELECT show_seat_id, COUNT(*) FROM booking_seat GROUP BY show_seat_id HAVING COUNT(*) > 1;
+
+-- 2) Every BOOKED seat has exactly one sale, and vice versa
+SELECT ss.show_seat_id FROM show_seat ss
+LEFT JOIN booking_seat bs ON bs.show_seat_id = ss.show_seat_id
+WHERE (ss.status = 'BOOKED') <> (bs.show_seat_id IS NOT NULL);
+
+-- 3) No seat is HELD by a booking that is no longer PENDING (leaked holds)
+SELECT ss.show_seat_id FROM show_seat ss
+JOIN booking b ON b.booking_id = ss.hold_booking_id
+WHERE ss.status = 'HELD' AND b.status <> 'PENDING';
+
+-- 4) State-flag consistency: HELD <=> hold_booking_id is set
+SELECT show_seat_id FROM show_seat
+WHERE (status = 'HELD') <> (hold_booking_id IS NOT NULL);
+
+-- 5) Every CONFIRMED booking has a SUCCESS payment
+SELECT b.booking_id FROM booking b
+LEFT JOIN payment p ON p.booking_id = b.booking_id AND p.status = 'SUCCESS'
+WHERE b.status = 'CONFIRMED' AND p.payment_id IS NULL;
+```
+
+Report p50/p95/p99 latency, throughput, deadlock count (`SHOW ENGINE INNODB STATUS`), and lock-wait time. Compare the pessimistic and optimistic variants to justify the design choice.
+
+---
+
+## 8. How to run
+
+Copy the SQL blocks into the `mysql` client (or into `schema.sql`, `seed.sql` and `queries.sql` files in your repo) in this order:
+DDL (section 2) → trigger → sample data (section 3) → optional sweeper event (5.5) → P2 queries (section 6).
